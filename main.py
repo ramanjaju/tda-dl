@@ -1,26 +1,27 @@
+
 import streamlit as st
 import cv2
-import os
 import numpy as np
 from datetime import datetime
 
 from detector import detect_face
 from embedder import get_embedding
-from recognizer import save_user_embedding, knn_match
+from recognizer import save_user_embedding, knn_match, svm_match
 
 # Page configuration
 st.set_page_config(page_title="Facial Scanner", layout="centered")
 st.title("🔐 Facial Recognition Unlock System")
 
-# Camera frame capture
+# --- Utility functions ---
+
 def capture_frame():
     cap = cv2.VideoCapture(0)
     ret, frame = cap.read()
     cap.release()
     return frame if ret else None
 
-# Brightness correction
 def auto_brighten(img):
+    """Automatically enhance brightness using histogram equalization."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
     v_eq = cv2.equalizeHist(v)
@@ -28,7 +29,7 @@ def auto_brighten(img):
     brightened = cv2.cvtColor(hsv_eq, cv2.COLOR_HSV2BGR)
     return brightened
 
-# Registration process
+# --- Registration Process ---
 def register(name):
     st.info("📸 Please look into the camera. Capturing multiple frames...")
 
@@ -47,13 +48,16 @@ def register(name):
         face = detect_face(frame)
 
         if face is not None:
-            embedding = get_embedding(face)
+            # Optional: resize face to standard size (improves embedding consistency)
+            face_resized = cv2.resize(face, (160, 160))
+            embedding = get_embedding(face_resized)
+
             if embedding is not None:
                 embeddings.append(embedding)
                 frame_count += 1
-                st.image(cv2.cvtColor(face, cv2.COLOR_BGR2RGB), caption=f"Captured Face {frame_count}")
+                st.image(cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB), caption=f"Captured Face {frame_count}")
         else:
-            st.warning("No face detected. Try again.")
+            st.warning("No face detected. Try again...")
 
     cap.release()
 
@@ -61,32 +65,61 @@ def register(name):
         save_user_embedding(name, embeddings)
         st.success(f"✅ {name} registered successfully!")
     else:
-        st.error("No face captured. Please retry.")
+        st.error("⚠️ No face captured. Please retry.")
 
-# Unlock logic
-def unlock():
+
+# --- Unlock Logic ---
+def unlock(algorithm):
     st.header("🔓 Face Unlock")
+
     if st.button("Scan Face"):
-        frame = capture_frame()
-        if frame is None:
-            st.error("Camera error.")
+        st.info("📷 Scanning for your face... please stay still for 3 seconds.")
+        cap = cv2.VideoCapture(0)
+        found_face = False
+        best_face = None
+        embedding = None
+
+        for attempt in range(10):  # Capture multiple frames
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            frame = auto_brighten(frame)
+            face = detect_face(frame)
+
+            # Skip small or unclear detections
+            if face is not None and face.shape[0] > 60 and face.shape[1] > 60:
+                found_face = True
+                best_face = face
+                face_resized = cv2.resize(face, (160, 160))
+                embedding = get_embedding(face_resized)
+                break
+
+        cap.release()
+
+        if not found_face:
+            st.warning("⚠️ No face detected. Please ensure proper lighting and face position.")
             return
 
-        frame = auto_brighten(frame)
-        face = detect_face(frame)
-        if face is not None:
-            embedding = get_embedding(face)
-            matched_user = knn_match(embedding, k=1, threshold=0.7)
-            st.image(cv2.cvtColor(face, cv2.COLOR_BGR2RGB), caption="Scanned Face")
+        if embedding is None:
+            st.error("❌ Could not extract face embedding. Try again.")
+            return
 
-            if matched_user:
-                st.success(f"✅ Access Granted: Welcome, {matched_user}!")
-            else:
-                st.error("❌ Access Denied: Face not recognized.")
+        st.image(cv2.cvtColor(best_face, cv2.COLOR_BGR2RGB), caption="Scanned Face")
+
+        if algorithm == "k-NN":
+            matched_user, score = knn_match(embedding)
+            label = "Similarity"
         else:
-            st.warning("No face detected.")
+            matched_user, score = svm_match(embedding)
+            label = "Probability"
 
-# Sidebar mode selection
+        if matched_user:
+            st.success(f"✅ Access Granted: Welcome, {matched_user}! ({label}: {score:.2f})")
+        else:
+            st.error(f"🚫 Access Denied: Face not recognized. ({label}: {score:.2f})")
+
+# # --- Sidebar ---
 mode = st.sidebar.radio("Select Mode", ["Register", "Unlock"])
 
 if mode == "Register":
@@ -98,4 +131,5 @@ if mode == "Register":
         else:
             register(name)
 else:
-    unlock()
+    algorithm = st.sidebar.radio("Select Algorithm", ["k-NN", "SVM"])
+    unlock(algorithm)
